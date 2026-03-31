@@ -6,4 +6,4 @@
 | Architecture | S-NIAH-PK<br>2K | S-NIAH-PK<br>4K | S-NIAH-PK<br>8K | S-NIAH-N<br>2K | S-NIAH-N<br>4K | S-NIAH-N<br>8K | S-NIAH-UUID<br>2K | S-NIAH-UUID<br>4K | S-NIAH-UUID<br>8K |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | LongHorn | 75.0 | 57.9 | 39.3 | 73.6 | 56.4 | 35.0 | 77.9 | 60.7 | 40.0 |
-| MuonLongHorn (Ours)| | | | | | | |
+| MuonLongHorn (Ours)| 76.1 | 60.3 | 47.8 | 74.2 | 58.3 | 42.4| 80.6 | 61.6 | 45.3 |
