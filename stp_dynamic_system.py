@@ -681,6 +681,7 @@ class RepresentationTrainer(Trainer):
         self.tube_gamma = kwargs.pop('tube_gamma', 0.95)
         self.tube_tau = kwargs.pop('tube_tau', 1e-3)
         self.lbd_ts = kwargs.pop('lbd_ts', 0.0)
+        self.tube_log_interval = kwargs.pop('tube_log_interval', 0)
         self.lyap_tube = LyapunovTubeLoss(
             gamma=self.tube_gamma,
             tau=self.tube_tau,
@@ -1150,16 +1151,50 @@ class RepresentationTrainer(Trainer):
                     # user: [user_start_end[0]+1, user_start_end[1]], assistant: [assistant_start_end[0]+1, assistant_start_end[1]]
                     user_bounds.append((us0 + 1, ue0))
                     assistant_bounds.append((as0 + 1, ae0))
-                jepa_loss = self.lyap_tube(
-                    h_dyn,
-                    user_bounds=user_bounds,
-                    assistant_bounds=assistant_bounds,
+                sync_ok = getattr(getattr(self, "accelerator", None), "sync_gradients", True)
+                chief = getattr(self.args, "process_index", 0) == 0
+                want_diag = (
+                    self.tube_log_interval > 0
+                    and chief
+                    and sync_ok
+                    and (self.state.global_step % self.tube_log_interval == 0)
                 )
-                if self.lbd_ts > 0:
-                    m = inputs["attention_mask"].bool()
-                    jepa_loss = jepa_loss + self.lbd_ts * temporal_straightening_curvature_loss(
-                        h_dyn, mask_valid=m
+                if want_diag:
+                    jepa_loss, tube_diag = self.lyap_tube(
+                        h_dyn,
+                        user_bounds=user_bounds,
+                        assistant_bounds=assistant_bounds,
+                        return_diagnostics=True,
                     )
+                    ts_part = torch.tensor(0.0, device=h_dyn.device, dtype=h_dyn.dtype)
+                    if self.lbd_ts > 0:
+                        m = inputs["attention_mask"].bool()
+                        ts_part = temporal_straightening_curvature_loss(h_dyn, mask_valid=m)
+                        jepa_loss = jepa_loss + self.lbd_ts * ts_part
+                    print(
+                        "[tube_diag] "
+                        f"step={self.state.global_step} "
+                        f"mean_V_curr={tube_diag['mean_V_curr'].float().item():.6f} "
+                        f"mean_V_prev={tube_diag['mean_V_prev'].float().item():.6f} "
+                        f"delta_mean_V={tube_diag['delta_mean_V'].float().item():+.2e} "
+                        f"mean_raw_viol={tube_diag['mean_raw_violation'].float().item():+.4f} "
+                        f"viol_rate={tube_diag['viol_rate'].float().item():.4f} "
+                        f"tube_softplus_mean={tube_diag['tube_softplus_mean'].float().item():.5f} "
+                        f"lm_loss={lm_loss.detach().float().item():.5f} "
+                        f"jepa_total={jepa_loss.detach().float().item():.5f}",
+                        flush=True,
+                    )
+                else:
+                    jepa_loss = self.lyap_tube(
+                        h_dyn,
+                        user_bounds=user_bounds,
+                        assistant_bounds=assistant_bounds,
+                    )
+                    if self.lbd_ts > 0:
+                        m = inputs["attention_mask"].bool()
+                        jepa_loss = jepa_loss + self.lbd_ts * temporal_straightening_curvature_loss(
+                            h_dyn, mask_valid=m
+                        )
             elif self.linear == "e2e":
                 # Suppose sequence is [start, end), Enc(end - 1) - Enc(start - 1)
                 user_start_embedding = hidden_states[range(hidden_states.shape[0]), self.user_start_end[:, 0]]
@@ -1419,6 +1454,12 @@ def main():
         default=0.0,
         help="Weight for Temporal-Straightening-style local curvature on masked positions (0 = off).",
     )
+    parser.add_argument(
+        "--tube_log_interval",
+        type=int,
+        default=50,
+        help="Every N global steps (rank 0, after grad sync), print tube diagnostics: mean V, viol_rate, etc. 0 = off.",
+    )
 
     args = parser.parse_args()
 
@@ -1672,6 +1713,7 @@ def main():
             tube_gamma=args.tube_gamma,
             tube_tau=args.tube_tau,
             lbd_ts=args.lbd_ts,
+            tube_log_interval=args.tube_log_interval,
         )
     
     if torch.cuda.current_device() == 0 and args.lora:
