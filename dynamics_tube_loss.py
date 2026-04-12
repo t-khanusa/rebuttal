@@ -18,8 +18,10 @@ Research framing (paper outline)
    displacement from a pivot lies almost in span{v_geo} — equivalently small
    normal component e_t after orthogonal projection.
 
-3. **Lyapunov candidate (transversal).** V_t = ||e_t||^2 where e_t is the
-   component of (appropriately defined) d_t perpendicular to v_geo. This plays
+3. **Lyapunov candidate (transversal).** V_t = ||e_t||^2 / (||v_geo||^2 + eps),
+   i.e. orthogonal energy relative to squared secant length. This is **scale-invariant**
+   if h is rescaled (e and v_geo scale together) and avoids both O(D) sums and
+   arbitrary per-dimension means. This plays
    the role of a Lyapunov function for *transverse* dynamics (Wiggins Ch.2
    spirit), not stability of full closed-loop LM dynamics.
 
@@ -53,7 +55,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 
 def temporal_straightening_curvature_loss(
@@ -91,8 +93,9 @@ def temporal_straightening_curvature_loss(
 
 class LyapunovTubeLoss(nn.Module):
     """
-    Lyapunov-regularized tube loss: orthogonal energy to a secant geodesic plus
-    discrete contraction V_{t+1} <= gamma V_t + tau on valid transitions.
+    Lyapunov-regularized tube loss: orthogonal energy (normalized by ||v_geo||^2)
+    relative to a secant, plus discrete contraction V_{t+1} <= gamma V_t + tau
+    on valid transitions.
 
     Modes
     -----
@@ -119,7 +122,9 @@ class LyapunovTubeLoss(nn.Module):
         mask_valid: Optional[torch.Tensor] = None,
         user_bounds: Optional[List[Tuple[int, int]]] = None,
         assistant_bounds: Optional[List[Tuple[int, int]]] = None,
-    ) -> torch.Tensor:
+        *,
+        return_diagnostics: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         B, T, D = h.shape
         device = h.device
 
@@ -163,7 +168,10 @@ class LyapunovTubeLoss(nn.Module):
         dot = (d_all * v_norm.unsqueeze(1)).sum(dim=-1, keepdim=True)
         p_all = dot * v_norm.unsqueeze(1)
         e_all = d_all - p_all
-        V_all = (e_all**2).sum(dim=-1)
+        # Dimensionless V: transversal energy vs reference chord energy (scale-invariant in h).
+        v_geo_sq_norm = (v_geodesic**2).sum(dim=-1).clamp(min=1e-8)
+        e_sq_norm = (e_all**2).sum(dim=-1)
+        V_all = e_sq_norm / v_geo_sq_norm.unsqueeze(1)
 
         V_prev = V_all[:, :-1]
         V_curr = V_all[:, 1:]
@@ -176,8 +184,42 @@ class LyapunovTubeLoss(nn.Module):
         masked = loss_matrix * valid_transitions.float()
         num_valid = valid_transitions.sum()
         if num_valid == 0:
-            return h.sum() * 0.0
-        return masked.sum() / num_valid
+            z = h.sum() * 0.0
+            if return_diagnostics:
+                zero = torch.zeros((), device=device, dtype=h.dtype)
+                return z, {
+                    "mean_V_curr": zero,
+                    "mean_V_prev": zero,
+                    "delta_mean_V": zero,
+                    "mean_raw_violation": zero,
+                    "viol_rate": zero,
+                    "tube_softplus_mean": zero,
+                }
+            return z
+
+        num_f = num_valid.to(h.dtype)
+        vf = valid_transitions.to(h.dtype)
+        mean_V_curr = (V_curr * vf).sum() / num_f
+        mean_V_prev = (V_prev * vf).sum() / num_f
+        # Along long spans, marginal means of V[t] vs V[t+1] over edges are often near-equal
+        # (differ only by boundary terms); use delta_mean_V to see small drift.
+        delta_mean_V = mean_V_curr - mean_V_prev
+        mean_raw_violation = (violation * vf).sum() / num_f
+        viol_pos = (violation > 0).to(h.dtype) * vf
+        viol_rate = viol_pos.sum() / num_f
+        tube_softplus_mean = masked.sum() / num_f
+        loss = tube_softplus_mean
+
+        if return_diagnostics:
+            return loss, {
+                "mean_V_curr": mean_V_curr.detach(),
+                "mean_V_prev": mean_V_prev.detach(),
+                "delta_mean_V": delta_mean_V.detach(),
+                "mean_raw_violation": mean_raw_violation.detach(),
+                "viol_rate": viol_rate.detach(),
+                "tube_softplus_mean": tube_softplus_mean.detach(),
+            }
+        return loss
 
 
 class UnifiedDynamicsRegularizer(nn.Module):
@@ -247,3 +289,16 @@ if __name__ == "__main__":
     L_tube.backward(retain_graph=True)
     assert L_tube.shape == ()
     assert info["loss_tube"].numel() == 1
+    assert h.grad is not None and h.grad.abs().sum() > 0, "tube loss must backprop into h"
+
+    h2 = torch.randn(1, 12, 16, requires_grad=True)
+    L2, diag = LyapunovTubeLoss()(
+        h2,
+        user_bounds=[(1, 3)],
+        assistant_bounds=[(5, 9)],
+        return_diagnostics=True,
+    )
+    assert "delta_mean_V" in diag
+    h2.grad = None
+    L2.backward()
+    assert h2.grad is not None and h2.grad.abs().sum() > 0, "STP bounds path must backprop into h"
