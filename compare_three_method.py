@@ -165,6 +165,10 @@ def run_torchrun_stp(
     last_token: int,
     lbd: float,
     predictors: int,
+    tube_gamma: float = 0.95,
+    tube_tau: float = 1e-3,
+    lbd_ts: float = 0.0,
+    tube_log_interval: int = 50,
 ):
     """Invoke `torchrun stp.py` for one training mode."""
     output_dir = Path(output_dir)
@@ -207,11 +211,13 @@ def run_torchrun_stp(
             [
                 "--dynamics_tube",
                 "--tube_gamma",
-                "0.95",
+                str(tube_gamma),
                 "--tube_tau",
-                "1e-3",
+                str(tube_tau),
                 "--lbd_ts",
-                "0.02",
+                str(lbd_ts),
+                "--tube_log_interval",
+                str(tube_log_interval),
             ]
         )
     else:
@@ -266,7 +272,26 @@ def parse_args():
         "--lbd_dynamics",
         type=float,
         default=0.01,
-        help="Aux loss weight for dynamics tube (often lower than --lbd; tube competes with LM CE).",
+        help="Aux weight for dynamics tube only; ablation suggests sweeping ~0.01–0.05.",
+    )
+    p.add_argument("--tube_gamma", type=float, default=0.95, help="Dynamics: Lyapunov decay factor (passed to stp.py).")
+    p.add_argument("--tube_tau", type=float, default=1e-3, help="Dynamics: tube slack tau (passed to stp.py).")
+    p.add_argument(
+        "--lbd_ts",
+        type=float,
+        default=0.0,
+        help="Dynamics: temporal-straightening curvature weight; default 0 for pure Lyapunov-tube ablation.",
+    )
+    p.add_argument(
+        "--tube_log_interval",
+        type=int,
+        default=50,
+        help="Dynamics: print [tube_diag] every N steps (0 = off). Passed to stp.py.",
+    )
+    p.add_argument(
+        "--only_dynamics",
+        action="store_true",
+        help="Train and compute PPL only for dynamics (skip regular and STP).",
     )
     p.add_argument("--predictors", type=int, default=0)
     p.add_argument("--eval_batch_size", type=int, default=4, help="Batch size for PPL only.")
@@ -299,8 +324,11 @@ def main():
     if not stp_py.is_file():
         sys.exit(f"Missing {stp_py}")
 
+    train_methods = ("dynamics",) if args.only_dynamics else ("dynamics", "stp", "regular")
+    ppl_methods = ("dynamics",) if args.only_dynamics else ("regular", "stp", "dynamics")
+
     if not args.skip_train:
-        for method in ("dynamics", "stp", "regular"):
+        for method in train_methods:
             lbd = args.lbd_dynamics if method == "dynamics" else args.lbd
             run_torchrun_stp(
                 stp_py=stp_py,
@@ -318,10 +346,15 @@ def main():
                 last_token=args.last_token,
                 lbd=lbd,
                 predictors=args.predictors,
+                tube_gamma=args.tube_gamma,
+                tube_tau=args.tube_tau,
+                lbd_ts=args.lbd_ts,
+                tube_log_interval=args.tube_log_interval,
             )
 
     results = {}
-    for method, ckpt in dirs.items():
+    for method in ppl_methods:
+        ckpt = dirs[method]
         if not ckpt.is_dir():
             print(f"Skip PPL: missing checkpoint dir {ckpt}")
             results[method] = None
@@ -338,7 +371,7 @@ def main():
         results[method] = ppl
 
     print("\n========== Perplexity comparison ==========")
-    for m in ("regular", "stp", "dynamics"):
+    for m in ppl_methods:
         v = results.get(m)
         print(f"  {m:12s}  PPL = {v if v is not None else 'N/A'}")
     summary_path = out_root / "ppl_comparison.json"
