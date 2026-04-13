@@ -185,11 +185,11 @@ Ablate $\(\lambda_{\mathrm{cos}} \in \{0, \cdot\}\)$ to show Lyapunov tube **rep
 **What would be needed (control / feedback viewpoint, consistent with Wiggins’ emphasis on the actual map):**
 
 1. **Closed-loop feedback at inference**  
-   Treat $\(V_t\)$ (or \(\|$e_t$\|\)) as a **running output** of the generator. **Steer** generation so $\(V_t\)$ stays small, e.g.:
+   Treat $\(V_t\)$ (or \($\|e_t\|\$)) as a **running output** of the generator. **Steer** generation so $\(V_t\)$ stays small, e.g.:
    - **Latent guidance:** small gradient step on logits or on last-layer hidden state each step to reduce $\(V_t\)$ (needs a defined \($v_{\mathrm{geo}}\$) or reference trajectory online—hard without a fixed prompt structure).
    - **Classifier-free / energy guidance:** add a term proportional to $\(-\nabla_{h}\log p(h \mid \text{on-tube})\)$ if you train a scorer (expensive).
 
-2. **Reference trajectory \(h^\star_t\)**  
+2. **Reference trajectory $\(h^\star_t\)$**  
    If you have a **nominal** hidden trajectory (teacher model, EMA, or encoded plan), define **tracking error** $\(\tilde e_t = h_t - h^\star_t\)$ and minimize $\(\|\tilde e_t\|\)$ or a Lyapunov function of $\(\tilde e_t\)$ **during** decoding—this is **output regulation**, not just train-time regularization.
 
 3. **Constrained decoding**  
