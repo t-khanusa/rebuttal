@@ -10,6 +10,9 @@ Methods (aligned with run_stp.py naming intent):
 PPL is exp(mean NLL) over all non-masked label positions (labels != -100), using the same
 chat template / masking as each training path.
 
+STP-style extras (Huang et al.): --eval_accuracy, --eval_token_accuracy, --eval_snr_proxy;
+--data_fraction for seeded train subsampling (data efficiency).
+
 Examples
 --------
   # Train all three (each run uses torchrun internally). Do NOT wrap this script in torchrun.
@@ -37,6 +40,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import stp_eval_metrics
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -169,8 +173,10 @@ def run_torchrun_stp(
     tube_tau: float = 1e-3,
     lbd_ts: float = 0.0,
     tube_log_interval: int = 50,
+    single_gpu: bool = False,
+    gpu_id: int = 0,
 ):
-    """Invoke `torchrun stp.py` for one training mode."""
+    """Invoke training for one mode (torchrun or single-GPU python)."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -224,6 +230,17 @@ def run_torchrun_stp(
         raise ValueError(method)
 
     env = os.environ.copy()
+    if single_gpu:
+        env.pop("WORLD_SIZE", None)
+        env.pop("RANK", None)
+        env.pop("LOCAL_RANK", None)
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        cmd = [sys.executable] + stp_args
+        print(f"\n>>> single-gpu mode (CUDA_VISIBLE_DEVICES={gpu_id})", flush=True)
+        print(">>>", " ".join(cmd), flush=True)
+        subprocess.run(cmd, cwd=str(ROOT), env=env, check=True)
+        return
+
     # Fresh port each subprocess: a shell-exported MASTER_PORT would otherwise be reused
     # across all three torchrun calls and can cause EADDRINUSE.
     master_addr = env.get("MASTER_ADDR", "127.0.0.1")
@@ -259,23 +276,30 @@ def parse_args():
     p.add_argument("--dataset_name", type=str, default="synth", help="Stem; uses {data_prefix}{name}_train.jsonl")
     p.add_argument("--data_prefix", type=str, default="datasets/", help="Prefix for train/test JSONL paths.")
     p.add_argument("--output_root", type=str, default="compare_three_runs", help="Directory for three checkpoints.")
-    p.add_argument("--num_epochs", type=int, default=1)
+    p.add_argument("--num_epochs", type=int, default=6)
     p.add_argument("--learning_rate", type=float, default=2e-5)
     p.add_argument("--finetune_seed", type=int, default=42)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--grad_accum", type=int, default=4)
     p.add_argument("--max_length", type=int, default=512)
     p.add_argument("--nproc", type=int, default=2, help="torchrun --nproc_per_node")
+    p.add_argument("--single_gpu", action="store_true", help="Train with plain python on one GPU (no torchrun).")
+    p.add_argument("--gpu_id", type=int, default=0, help="GPU id used when --single_gpu is set.")
     p.add_argument("--last_token", type=int, default=-2)
     p.add_argument("--lbd", type=float, default=0.02, help="Aux loss weight for regular (unused) / stp.")
     p.add_argument(
         "--lbd_dynamics",
         type=float,
-        default=0.01,
+        default=0.05,
         help="Aux weight for dynamics tube only; ablation suggests sweeping ~0.01–0.05.",
     )
     p.add_argument("--tube_gamma", type=float, default=0.95, help="Dynamics: Lyapunov decay factor (passed to stp.py).")
-    p.add_argument("--tube_tau", type=float, default=1e-3, help="Dynamics: tube slack tau (passed to stp.py).")
+    p.add_argument(
+        "--tube_tau",
+        type=float,
+        default=1e-3,
+        help="Dynamics: tube slack tau (passed to stp.py). Larger tau relaxes V_{t+1} <= γ V_t + τ.",
+    )
     p.add_argument(
         "--lbd_ts",
         type=float,
@@ -299,6 +323,36 @@ def parse_args():
     p.add_argument("--ckpt_regular", type=str, default=None)
     p.add_argument("--ckpt_stp", type=str, default=None)
     p.add_argument("--ckpt_dynamics", type=str, default=None)
+    p.add_argument(
+        "--data_fraction",
+        type=float,
+        default=1.0,
+        help="Random subsample of train JSONL (seeded) before training; 1.0 = full train.",
+    )
+    p.add_argument("--train_subset_seed", type=int, default=42, help="Seed for --data_fraction shuffle.")
+    p.add_argument(
+        "--eval_accuracy",
+        action="store_true",
+        help="Greedy exact-match accuracy vs gold assistant (stp_eval_metrics).",
+    )
+    p.add_argument(
+        "--eval_token_accuracy",
+        action="store_true",
+        help="Teacher-forced next-token accuracy on supervised labels.",
+    )
+    p.add_argument(
+        "--eval_snr_proxy",
+        action="store_true",
+        help="Tube geometry SNR: mean parallel^2 / perp^2 (STP signal/noise picture).",
+    )
+    p.add_argument("--max_gen_eval", type=int, default=500, help="Max examples for --eval_accuracy.")
+    p.add_argument("--snr_max_batches", type=int, default=80, help="Max batches for --eval_snr_proxy.")
+    p.add_argument(
+        "--token_acc_max_batches",
+        type=int,
+        default=0,
+        help="Max batches for token accuracy; 0 = full eval set.",
+    )
     return p.parse_args()
 
 
@@ -327,13 +381,23 @@ def main():
     train_methods = ("dynamics",) if args.only_dynamics else ("dynamics", "stp", "regular")
     ppl_methods = ("dynamics",) if args.only_dynamics else ("regular", "stp", "dynamics")
 
+    effective_train = train_file
+    if args.data_fraction < 1.0 - 1e-9:
+        effective_train = out_root / (
+            f"_train_subset_{args.dataset_name}_f{args.data_fraction}_s{args.train_subset_seed}.jsonl"
+        )
+        effective_train = stp_eval_metrics.materialize_train_fraction(
+            train_file, effective_train, args.data_fraction, seed=args.train_subset_seed
+        )
+        print(f"Using training subset ({args.data_fraction:.4f} of lines): {effective_train}", flush=True)
+
     if not args.skip_train:
         for method in train_methods:
             lbd = args.lbd_dynamics if method == "dynamics" else args.lbd
             run_torchrun_stp(
                 stp_py=stp_py,
                 output_dir=dirs[method],
-                train_file=train_file,
+                train_file=effective_train,
                 model_name=args.model_name,
                 num_epochs=args.num_epochs,
                 learning_rate=args.learning_rate,
@@ -350,6 +414,8 @@ def main():
                 tube_tau=args.tube_tau,
                 lbd_ts=args.lbd_ts,
                 tube_log_interval=args.tube_log_interval,
+                single_gpu=args.single_gpu,
+                gpu_id=args.gpu_id,
             )
 
     results = {}
@@ -374,18 +440,93 @@ def main():
     for m in ppl_methods:
         v = results.get(m)
         print(f"  {m:12s}  PPL = {v if v is not None else 'N/A'}")
+
+    acc_results: dict = {}
+    tok_results: dict = {}
+    snr_results: dict = {}
+    tok_max = None if args.token_acc_max_batches <= 0 else args.token_acc_max_batches
+
+    if args.eval_accuracy:
+        print("\n========== Exact-match accuracy (greedy) ==========")
+        for m in ppl_methods:
+            ckpt = dirs[m]
+            if not ckpt.is_dir():
+                acc_results[m] = None
+                continue
+            acc = stp_eval_metrics.compute_exact_match_accuracy(
+                ckpt,
+                eval_file,
+                args.model_name,
+                max_new_tokens=min(256, args.max_length),
+                max_length=args.max_length,
+                max_examples=args.max_gen_eval,
+            )
+            acc_results[m] = acc
+            print(f"  {m:12s}  acc = {acc:.4f}")
+
+    if args.eval_token_accuracy:
+        print("\n========== Teacher-forced token accuracy ==========")
+        for m in ppl_methods:
+            ckpt = dirs[m]
+            if not ckpt.is_dir():
+                tok_results[m] = None
+                continue
+            tacc = stp_eval_metrics.compute_teacher_forced_token_accuracy(
+                ckpt,
+                eval_file,
+                args.model_name,
+                m,
+                max_length=args.max_length,
+                batch_size=args.eval_batch_size,
+                predictors=args.predictors,
+                max_batches=tok_max,
+            )
+            tok_results[m] = tacc
+            if tacc == tacc:
+                print(f"  {m:12s}  token_acc = {tacc:.4f}")
+            else:
+                print(f"  {m:12s}  token_acc = nan")
+
+    if args.eval_snr_proxy:
+        print("\n========== Tube SNR proxy (eval set, mean over batches) ==========")
+        for m in ppl_methods:
+            ckpt = dirs[m]
+            if not ckpt.is_dir():
+                snr_results[m] = None
+                continue
+            snr = stp_eval_metrics.compute_tube_snr_proxy(
+                ckpt,
+                eval_file,
+                args.model_name,
+                max_length=args.max_length,
+                batch_size=max(1, args.eval_batch_size // 2),
+                predictors=args.predictors,
+                max_batches=args.snr_max_batches,
+            )
+            snr_results[m] = snr
+            print(f"  {m:12s}  SNR_db ≈ {snr.get('snr_db', float('nan')):.3f}")
+
     summary_path = out_root / "ppl_comparison.json"
+    summary = {
+        "model_name": args.model_name,
+        "dataset": args.dataset_name,
+        "eval_file": str(eval_file),
+        "train_file_effective": str(effective_train),
+        "data_fraction": args.data_fraction,
+        "train_subset_seed": args.train_subset_seed,
+        "ppl": {k: (float(v) if v is not None and not math.isinf(v) else None) for k, v in results.items()},
+    }
+    if acc_results:
+        summary["exact_match_accuracy"] = {k: (float(v) if v is not None and v == v else None) for k, v in acc_results.items()}
+    if tok_results:
+        summary["teacher_forced_token_accuracy"] = {
+            k: (float(v) if v is not None and v == v else None) for k, v in tok_results.items()
+        }
+    if snr_results:
+        summary["snr_proxy"] = snr_results
+
     with open(summary_path, "w") as f:
-        json.dump(
-            {
-                "model_name": args.model_name,
-                "dataset": args.dataset_name,
-                "eval_file": str(eval_file),
-                "ppl": {k: (float(v) if v is not None and not math.isinf(v) else None) for k, v in results.items()},
-            },
-            f,
-            indent=2,
-        )
+        json.dump(summary, f, indent=2)
     print(f"\nWrote {summary_path}")
 
 
