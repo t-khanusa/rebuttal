@@ -17,7 +17,7 @@ Replace purely geometric cosine heuristics with a **discrete-time Lyapunov-flavo
 - **Transversal component** $\(e_t = d_t - \Pi_{v} d_t\)$, **Lyapunov candidate** $\(V_t = \|e_t\|^2\)$.
 - **Training surrogate:** penalize violations of $\(V_{t+1} \le \gamma V_t + \tau\)$ on **valid** transitions (softplus/ReLU).
 
-**Claim style (theorem sketch, not automatic truth):** If the learned map along $\(t\)$ were a contraction in transversal coordinates with slack \(\tau\), then tube width would be bounded (discrete-time ISS flavor). Training **encourages** this; it does **not** prove stability of inference unless you add explicit model class assumptions.
+**Claim style (theorem sketch, not automatic truth):** If the learned map along $\(t\)$ were a contraction in transversal coordinates with slack \($\tau\$), then tube width would be bounded (discrete-time ISS flavor). Training **encourages** this; it does **not** prove stability of inference unless you add explicit model class assumptions.
 
 ## Theory correspondence (Stephen Wiggins, *Introduction to Applied Nonlinear Dynamical Systems and Chaos*, 2nd ed.)
 
@@ -46,7 +46,7 @@ v_{\mathrm{geo}} = h_{t_{\mathrm{end}}} - h_{t_{\mathrm{start}}}, \qquad
 d_t = h_t - h_{t_{\mathrm{start}}}.
 $$
 
-**STP / Q–A gap mode** (inclusive token bounds $\([u_s,u_e]\)$, $\([a_s,a_e]\)$):
+**STP / Q–A gap mode** (inclusive token bounds $\([u_s,u_e]\)$, $\([a_s,a_e]\))$:
 
 $$
 v_{\text{user}} = h_{u_e} - h_{u_s}
@@ -140,8 +140,16 @@ $$
 \mathcal{L} = \mathcal{L}_{\mathrm{pred}} + \lambda_{\mathrm{tube}} \mathcal{L}_{\mathrm{Lyap}} + \lambda_{\mathrm{TS}} \mathcal{L}_{\mathrm{curv}}
 $$
 
-- $$\(\mathcal{L}_{\mathrm{curv}}\)$$: mean $$\(1-\cos(h_{t+1}-h_t, h_{t+2}-h_{t+1})\)$$ on valid triples (matches TS paper).
-- $\(\mathcal{L}_{\mathrm{Lyap}}\)$: `LyapunovTubeLoss` with `mask_valid`.
+- Curvature loss:
+
+$$
+\mathcal{L}_{\mathrm{curv}} =
+\mathrm{mean}\left(
+1 - \cos(h_{t+1}-h_t,\; h_{t+2}-h_{t+1})
+\right)
+$$
+
+- $\\mathcal{L}_{\mathrm{Lyap}}\$: `LyapunovTubeLoss` with `mask_valid`.
 
 **LLM (single forward, Appendix G style)**
 
